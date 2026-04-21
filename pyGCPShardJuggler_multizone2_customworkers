@@ -1,0 +1,146 @@
+''' A python version of the GCPShardJuggler script by RogueSMG
+    (Ported from https://github.com/RogueSMG/GCPShardJuggler) 
+    Improved to work with 5 zone at once, as per official google quota limits described here: https://docs.cloud.google.com/dns/quotas#name-server-limits
+    ** This is a non-manual, AI-generated code (might contain some manual changes). While it has been tested, any blaim is to go towards the AI model. ** 
+'''
+
+''' Usage: 
+python pyGCPShardJuggler_multizone2_customworkers --dns-zone zonex --project-id myproj --dns-name example.com. --shard ns-cloud-a1.googledomains.com.
+python pyGCPShardJuggler_multizone2_customworkers --dns-zone zonex --project-id myproj --dns-name example.com. --shard ns-cloud-c1
+python pyGCPShardJuggler_multizone2_customworkers --dns-zone zonex --project-id myproj --dns-name example.com. --shard x1
+'''
+
+import argparse
+import subprocess
+import json
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+GCLOUD = r"C:\Users\Administrator\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd"
+
+
+def run(cmd):
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    return result.stdout, result.stderr, result.returncode
+
+
+def gcloud(args):
+    return run([GCLOUD] + args)
+
+
+def create_zone(zone, project, dns_name):
+    out, err, code = gcloud([
+        "dns", "managed-zones", "create", zone,
+        f"--dns-name={dns_name}",
+        f"--project={project}",
+        f"--description=Shard test zone {zone}",
+        "--visibility=public",
+        "--dnssec-state=off",
+        "--quiet"
+    ])
+    return code, out, err
+
+
+def describe_zone(zone, project):
+    out, err, code = gcloud([
+        "dns", "managed-zones", "describe", zone,
+        f"--project={project}",
+        "--format=json",
+        "--quiet"
+    ])
+
+    if code != 0:
+        return None
+
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+
+def delete_zone(zone, project):
+    gcloud([
+        "dns", "managed-zones", "delete", zone,
+        f"--project={project}",
+        "--quiet"
+    ])
+
+
+def worker(i, base_zone, project, dns_name, shard):
+    zone = f"{base_zone}-{i}"
+
+    print(f"[START] {zone}")
+
+    try:
+        code, out, err = create_zone(zone, project, dns_name)
+
+        if code != 0:
+            print(f"[CREATE FAIL] {zone}: {err.strip()}")
+            return False, zone, None
+
+        data = describe_zone(zone, project)
+
+        if not data:
+            print(f"[DESCRIBE FAIL] {zone}")
+            return False, zone, None
+
+        ns = data.get("nameServers", [])
+        assigned = ns[0] if ns else ""
+
+        print(f"[ASSIGNED] {zone}: {assigned}")
+
+        if shard in assigned:
+            return True, zone, assigned
+
+        return False, zone, assigned
+
+    finally:
+        print(f"[CLEANUP] {zone}")
+        delete_zone(zone, project)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dns-zone", required=True)
+    parser.add_argument("--project-id", required=True)
+    parser.add_argument("--dns-name", required=True)
+    parser.add_argument("--shard", required=True)
+
+    args = parser.parse_args()
+
+    base_zone = args.dns_zone
+    project = args.project_id
+    dns_name = args.dns_name
+    shard = args.shard
+
+    batch = 0
+
+    while True:
+        batch += 1
+        print(f"\n=== Batch {batch} (5 workers) ===")
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [
+                pool.submit(worker, i, base_zone, project, dns_name, shard)
+                for i in range(5)
+            ]
+
+            for f in as_completed(futures):
+                success, zone, assigned = f.result()
+
+                if success:
+                    print("\n🎯 MATCH FOUND")
+                    print(f"Zone: {zone}")
+                    print(f"Shard: {assigned}")
+                    sys.exit(0)
+
+        print("No match in batch\n")
+
+
+if __name__ == "__main__":
+    main()
